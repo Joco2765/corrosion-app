@@ -1,5 +1,5 @@
 # app.py — Ultra-fast Inference (Images / ZIP / Video) — Dynamo/Inductor disabled
-# -------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # - HRNet-W48 head (compatible with your checkpoint)
 # - Speed: single-scale, no TTA, pad to /32, optional downscale on long side
 # - Video: optional downscale + frame-skip
@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 import timm
+from huggingface_hub import snapshot_download  # HF support
 
 # Optional GPU speed tweaks (no compilation)
 if torch.cuda.is_available():
@@ -90,7 +91,7 @@ class HRNetSegHead(nn.Module):
 def _clean_state_dict(sd: dict) -> dict:
     if isinstance(sd, dict) and any(k in sd for k in ("state_dict", "model")):
         sd = sd.get("state_dict", sd.get("model"))
-    if isinstance(sd, dict) and sd and all(isinstance(k, str) for k in sd.keys()):
+    if isinstance(sd, dict) and sd and all(isinstance(k, str) for k in sd.keys())):
         if any(k.startswith("module.") for k in sd.keys()):
             sd = {k.split("module.", 1)[1]: v for k, v in sd.items()}
     return sd
@@ -104,21 +105,83 @@ def _strict_load(model: nn.Module, sd: dict):
         raise RuntimeError(f"Incompatible checkpoint. Missing={len(missing)} ; Unexpected={len(unexpected)}")
     model.load_state_dict(sd, strict=True)
 
+# -------------------- Checkpoint resolution --------------------
+def _resolve_ckpt_path(ckpt_path: str) -> tuple[str, float]:
+    """
+    Resolve a checkpoint path:
+      - hf://user/repo/file.pth  -> download and return local path
+      - local file path          -> return as-is
+      - local directory          -> first .pth/.pt/.bin inside
+    Returns (local_path, mtime) so Streamlit cache invalidates if the file changes.
+    """
+    if not ckpt_path:
+        return "", 0.0
+
+    ckpt_path = ckpt_path.strip().strip('"').strip("'")
+
+    # Hugging Face
+    if ckpt_path.startswith("hf://"):
+        rest = ckpt_path[5:]
+        parts = rest.split("/")
+        if len(parts) < 3:
+            raise FileNotFoundError("HF path must be hf://<user>/<repo>/<file>.pth")
+        repo_id = "/".join(parts[:2])   # user/repo
+        rel_file = "/".join(parts[2:])  # path/in/repo/file.pth
+
+        # token for private repos
+        token = os.getenv("HF_TOKEN")
+        try:
+            token = token or st.secrets.get("HF_TOKEN")
+        except Exception:
+            pass
+
+        local_dir = snapshot_download(repo_id=repo_id, allow_patterns=[rel_file], token=token)
+        local_path = os.path.join(local_dir, rel_file)
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"Downloaded but file missing: {local_path}")
+        return local_path, os.path.getmtime(local_path)
+
+    # Local path / directory
+    p = os.path.expanduser(ckpt_path)
+    p = os.path.normpath(p)
+
+    if os.path.isdir(p):
+        for root, _, files in os.walk(p):
+            for f in files:
+                if f.lower().endswith((".pth", ".pt", ".bin")):
+                    fp = os.path.join(root, f)
+                    return fp, os.path.getmtime(fp)
+        raise FileNotFoundError(f"No checkpoint file (.pth/.pt/.bin) found in directory: {p}")
+
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"File not found: {p}")
+
+    return p, os.path.getmtime(p)
+
 @st.cache_resource(show_spinner=False)
-def get_model(ckpt_path: str) -> nn.Module:
+def get_model(resolved_ckpt_path: str, ckpt_mtime: float) -> nn.Module:
+    """
+    resolved_ckpt_path: real local path of the .pth
+    ckpt_mtime: used in cache signature to invalidate on file change
+    """
+    _ = (resolved_ckpt_path, ckpt_mtime)  # part of cache key
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = HRNetSegHead("hrnet_w48", pretrained=False, align_corners=False).to(device)
-    if not ckpt_path or not os.path.isfile(ckpt_path):
+
+    if not resolved_ckpt_path or not os.path.isfile(resolved_ckpt_path):
         st.sidebar.error("Checkpoint not found. Please check the path below.")
         return model.eval()
+
     try:
-        raw = torch.load(ckpt_path, map_location=device)
+        raw = torch.load(resolved_ckpt_path, map_location=device)
         sd = _clean_state_dict(raw)
         _strict_load(model, sd)
-        st.sidebar.success("✅ Checkpoint loaded (strict match)")
+        st.sidebar.success(f"✅ Checkpoint loaded: {os.path.basename(resolved_ckpt_path)}")
     except Exception as e:
         st.sidebar.error(f"❌ Strict load failed: {e}")
         st.stop()
+
     model.eval()
     return model
 
@@ -129,7 +192,7 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 @dataclass
 class InferenceCfg:
     img_max_long_side: int = 640      # downscale images (0 = original)
-    thr: float = 0.5                   # confidence index (threshold)
+    thr: float = 0.5                  # confidence index (threshold)
     post_close: int = 0
     post_open: int = 0
     overlay_alpha: float = 0.60
@@ -231,33 +294,33 @@ with st.sidebar:
     ckpt = st.text_input(
         "Checkpoint (.pth)",
         value="hf://Jonathan78520/corrosion-hrnet-w48/Checkpoint.pth",
-        help="Path to your model weights (.pth). On Streamlit Cloud, put the file in your repo and use a relative path like 'checkpoints/model.pth'."
+        help="Supports: 'hf://user/repo/file.pth', a local file path, or a directory containing a .pth/.pt/.bin."
     )
 
     # Images / performance
     CFG.img_max_long_side = st.number_input(
         "Images: max long side (px, 0=original)",
         min_value=0, max_value=4000, value=CFG.img_max_long_side, step=64,
-        help="Downscale the image before inference to speed up processing. 0 keeps the original size (slower but potentially more accurate)."
+        help="Downscale the image before inference to speed up processing. 0 keeps the original size."
     )
 
-    # ---- Confidence index (separate section) ----
+    # ---- Confidence (separate section) ----
     with st.expander("Confidence", expanded=True):
         CFG.thr = st.slider(
             "Confidence index",
             0.05, 0.95, float(CFG.thr), 0.01,
-            help="Probability threshold to convert the soft map into a binary mask. Higher = fewer false positives (more precision), but may miss small areas (less recall)."
+            help="Probability threshold converting the soft map into a binary mask. Higher = fewer false positives (more precision), but may miss small areas (less recall)."
         )
 
     # ---- Post-processing (separate section) ----
     with st.expander("Post-processing", expanded=True):
         CFG.post_close = st.select_slider(
             "Morphology — Closing", options=[0,1,2,3,4,5], value=CFG.post_close,
-            help="Removes tiny holes and connects nearby regions. Larger value = stronger effect."
+            help="Remove tiny holes and connect nearby regions. Larger value = stronger effect."
         )
         CFG.post_open  = st.select_slider(
             "Morphology — Opening", options=[0,1,2,3,4,5], value=CFG.post_open,
-            help="Removes small isolated speckles/noise. Larger value = stronger effect."
+            help="Remove small isolated speckles/noise. Larger value = stronger effect."
         )
 
     # Display
@@ -266,7 +329,17 @@ with st.sidebar:
         help="Transparency of the red overlay. Higher alpha = more opaque red on predicted areas."
     )
 
-model = get_model(ckpt)
+# Resolve checkpoint (supports hf://, local file, or directory)
+try:
+    _resolved_ckpt, _ckpt_mtime = _resolve_ckpt_path(ckpt)
+except Exception as e:
+    st.sidebar.error(str(e))
+    _resolved_ckpt, _ckpt_mtime = "", 0.0
+
+if _resolved_ckpt:
+    st.sidebar.caption(f"Using checkpoint: `{_resolved_ckpt}`")
+
+model = get_model(_resolved_ckpt, _ckpt_mtime)
 
 # -------------------------- Tabs --------------------------
 tab1, tab2, tab3 = st.tabs(["🔍 Single Image", "📦 Batch (ZIP of images)", "🎞️ Video"])
@@ -449,7 +522,3 @@ with tab3:
             for p in (in_path, out_path):
                 try: os.remove(p)
                 except Exception: pass
-
-
-
-
