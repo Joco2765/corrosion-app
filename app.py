@@ -14,7 +14,7 @@ import os as _os
 _os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")    # disable TorchDynamo
 _os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")  # disable Inductor
 
-import os  # <-- later usage (os.path, os.walk, remove, etc.)
+import os
 import io, zipfile, tempfile, time, math
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +32,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 import timm
-from huggingface_hub import snapshot_download  # <-- NEW: HF download
 
 # Optional GPU speed tweaks (no compilation)
 if torch.cuda.is_available():
@@ -109,32 +108,6 @@ def _strict_load(model: nn.Module, sd: dict):
 def get_model(ckpt_path: str) -> nn.Module:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = HRNetSegHead("hrnet_w48", pretrained=False, align_corners=False).to(device)
-
-    # --- NEW: Hugging Face support ("hf://user/repo/path/to/file.pth")
-    if ckpt_path and ckpt_path.startswith("hf://"):
-        rest = ckpt_path[5:]                     # strip "hf://"
-        parts = rest.split("/")
-        if len(parts) < 3:
-            st.sidebar.error("HF path must be hf://<user>/<repo>/<file>.pth")
-            st.stop()
-        repo_id = "/".join(parts[:2])            # user/repo
-        rel_file = "/".join(parts[2:])           # path in repo
-
-        # token for private repos: from env or Streamlit secrets
-        token = os.getenv("HF_TOKEN")
-        try:
-            token = token or st.secrets.get("HF_TOKEN")
-        except Exception:
-            pass
-
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            allow_patterns=[rel_file],
-            token=token
-        )
-        ckpt_path = os.path.join(local_dir, rel_file)
-    # --- END NEW ---
-
     if not ckpt_path or not os.path.isfile(ckpt_path):
         st.sidebar.error("Checkpoint not found. Please check the path below.")
         return model.eval()
@@ -156,10 +129,9 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 @dataclass
 class InferenceCfg:
     img_max_long_side: int = 640      # downscale images (0 = original)
-    thr: float = 0.5
+    thr: float = 0.5                   # confidence index (threshold)
     post_close: int = 0
     post_open: int = 0
-    fill_holes: bool = False
     overlay_alpha: float = 0.60
     # video
     video_max_long_side: int = 540    # 540p by default
@@ -245,13 +217,6 @@ def morph(mask_u8, close_k=0, open_k=0):
         out = cv2.morphologyEx(out, cv2.MORPH_OPEN, ker)
     return out
 
-def fill_holes(mask_u8):
-    h, w = mask_u8.shape
-    inv = 255 - mask_u8
-    ff = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(inv, ff, (0, 0), 0)
-    return 255 - inv
-
 def to_u8(x01):
     return (np.clip(x01, 0, 1) * 255).astype(np.uint8)
 
@@ -262,22 +227,44 @@ def overlay_red(img_rgb: np.ndarray, mask_u8: np.ndarray, alpha: float = 0.6) ->
 
 # ------------------------- Sidebar ------------------------
 with st.sidebar:
-    st.header("⚙️ Settings (speed first)")
+    st.header("⚙️ Settings")
     ckpt = st.text_input(
         "Checkpoint (.pth)",
-        value="hf://Jonathan78520/corrosion-hrnet-w48/Checkpoint.pth"  # <-- default to HF
+        value=r"C:\Users\jonat\OneDrive\Bureau\Corrosion app\checkpoints\Checkpoint.pth",
+        help="Path to your model weights (.pth). On Streamlit Cloud, put the file in your repo and use a relative path like 'checkpoints/model.pth'."
     )
-    # Images
-    CFG.img_max_long_side = st.number_input("Images: max long side (px, 0=original)", min_value=0, max_value=4000, value=CFG.img_max_long_side, step=64)
-    CFG.thr = st.slider("Binary threshold", 0.05, 0.95, float(CFG.thr), 0.01)
-    CFG.post_close = st.select_slider("Morphology — Closing", options=[0,1,2,3,4,5], value=CFG.post_close)
-    CFG.post_open  = st.select_slider("Morphology — Opening", options=[0,1,2,3,4,5], value=CFG.post_open)
-    CFG.fill_holes = st.checkbox("Fill holes", value=CFG.fill_holes)
-    CFG.overlay_alpha = st.slider("Overlay alpha", 0.1, 0.9, float(CFG.overlay_alpha), 0.05)
-    # Video
-    st.markdown("---")
-    CFG.video_max_long_side = st.number_input("Video: max long side (px, 0=original)", min_value=0, max_value=4000, value=CFG.video_max_long_side, step=60)
-    CFG.video_frame_skip = st.number_input("Video: process every Nth frame", min_value=1, max_value=10, value=CFG.video_frame_skip, step=1)
+
+    # Images / performance
+    CFG.img_max_long_side = st.number_input(
+        "Images: max long side (px, 0=original)",
+        min_value=0, max_value=4000, value=CFG.img_max_long_side, step=64,
+        help="Downscale the image before inference to speed up processing. 0 keeps the original size (slower but potentially more accurate)."
+    )
+
+    # ---- Confidence index (separate section) ----
+    with st.expander("Confidence", expanded=True):
+        CFG.thr = st.slider(
+            "Confidence index",
+            0.05, 0.95, float(CFG.thr), 0.01,
+            help="Probability threshold to convert the soft map into a binary mask. Higher = fewer false positives (more precision), but may miss small areas (less recall)."
+        )
+
+    # ---- Post-processing (separate section) ----
+    with st.expander("Post-processing", expanded=True):
+        CFG.post_close = st.select_slider(
+            "Morphology — Closing", options=[0,1,2,3,4,5], value=CFG.post_close,
+            help="Removes tiny holes and connects nearby regions. Larger value = stronger effect."
+        )
+        CFG.post_open  = st.select_slider(
+            "Morphology — Opening", options=[0,1,2,3,4,5], value=CFG.post_open,
+            help="Removes small isolated speckles/noise. Larger value = stronger effect."
+        )
+
+    # Display
+    CFG.overlay_alpha = st.slider(
+        "Overlay alpha", 0.1, 0.9, float(CFG.overlay_alpha), 0.05,
+        help="Transparency of the red overlay. Higher alpha = more opaque red on predicted areas."
+    )
 
 model = get_model(ckpt)
 
@@ -286,7 +273,10 @@ tab1, tab2, tab3 = st.tabs(["🔍 Single Image", "📦 Batch (ZIP of images)", "
 
 # --------- Single Image ---------
 with tab1:
-    up = st.file_uploader("Image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    up = st.file_uploader(
+        "Image (JPG/PNG)", type=["jpg", "jpeg", "png"],
+        help="Upload a single image. The app returns the binary mask and an overlay preview."
+    )
     if up:
         pil = Image.open(up).convert("RGB")
         rgb = np.array(pil)
@@ -295,8 +285,7 @@ with tab1:
             prob = predict_prob_map(model, pil)
         pred_u8 = to_u8(prob >= CFG.thr)
         pred_u8 = morph(pred_u8, CFG.post_close, CFG.post_open)
-        if CFG.fill_holes:
-            pred_u8 = fill_holes(pred_u8)
+
         ov = overlay_red(rgb, pred_u8, alpha=CFG.overlay_alpha)
 
         c1, c2, c3 = st.columns(3)
@@ -312,7 +301,10 @@ with tab1:
 
 # --------- Batch (ZIP) ----------
 with tab2:
-    zup = st.file_uploader("ZIP of images (JPG/PNG)", type=["zip"])
+    zup = st.file_uploader(
+        "ZIP of images (JPG/PNG)", type=["zip"],
+        help="Upload a .zip containing multiple JPG/PNG images. The app processes all, returns per-image masks, overlays, and a CSV summary."
+    )
     if zup:
         with tempfile.TemporaryDirectory() as td:
             with zipfile.ZipFile(zup, "r") as zf:
@@ -337,8 +329,6 @@ with tab2:
                         prob = predict_prob_map(model, pil)
                         pred_u8 = to_u8(prob >= CFG.thr)
                         pred_u8 = morph(pred_u8, CFG.post_close, CFG.post_open)
-                        if CFG.fill_holes:
-                            pred_u8 = fill_holes(pred_u8)
 
                         H, W = pred_u8.shape
                         area_px = int((pred_u8 > 0).sum())
@@ -362,7 +352,23 @@ with tab2:
 
 # --------- Video --------------
 with tab3:
-    vup = st.file_uploader("Video (MP4/AVI/MOV/MKV)", type=["mp4", "avi", "mov", "mkv"])
+    # Video settings only visible inside the Video tab
+    with st.expander("Video settings", expanded=True):
+        CFG.video_max_long_side = st.number_input(
+            "Video: max long side (px, 0=original)",
+            min_value=0, max_value=4000, value=CFG.video_max_long_side, step=60,
+            help="Downscale each frame before inference for speed. 0 keeps original frame size."
+        )
+        CFG.video_frame_skip = st.number_input(
+            "Video: process every Nth frame",
+            min_value=1, max_value=10, value=CFG.video_frame_skip, step=1,
+            help="Skip frames to go faster (e.g., 2 = analyze 1 frame out of 2). Higher value = faster but less temporal granularity."
+        )
+
+    vup = st.file_uploader(
+        "Video (MP4/AVI/MOV/MKV)", type=["mp4", "avi", "mov", "mkv"],
+        help="Upload a video. The app outputs a preview with a red overlay and lets you download the processed video."
+    )
     if vup:
         suffix = Path(vup.name).suffix or ".mp4"
         in_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -414,8 +420,6 @@ with tab3:
                         prob = predict_prob_map(model, pil)
                         pred_u8 = to_u8(prob >= CFG.thr)
                         pred_u8 = morph(pred_u8, CFG.post_close, CFG.post_open)
-                        if CFG.fill_holes:
-                            pred_u8 = fill_holes(pred_u8)
                         last_pred = pred_u8
                     else:
                         pred_u8 = last_pred
@@ -445,3 +449,4 @@ with tab3:
             for p in (in_path, out_path):
                 try: os.remove(p)
                 except Exception: pass
+
