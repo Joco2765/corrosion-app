@@ -230,7 +230,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     ckpt = st.text_input(
         "Checkpoint (.pth)",
-        value=r"C:\Users\jonat\OneDrive\Bureau\Corrosion app\checkpoints\Checkpoint.pth",
+        value=r"hf://Jonathan78520/corrosion-hrnet-w48/Checkpoint.pth",
         help="Path to your model weights (.pth). On Streamlit Cloud, put the file in your repo and use a relative path like 'checkpoints/model.pth'."
     )
 
@@ -449,5 +449,6 @@ with tab3:
             for p in (in_path, out_path):
                 try: os.remove(p)
                 except Exception: pass
+
 
 
